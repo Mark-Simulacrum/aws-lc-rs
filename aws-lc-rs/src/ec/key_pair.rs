@@ -3,54 +3,60 @@
 // Modifications copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR ISC
 
-use crate::ec::{
-    validate_ec_key, EcdsaSignatureFormat, EcdsaSigningAlgorithm, PublicKey, SCALAR_MAX_BYTES,
-};
+use crate::ec::{self, validate_ec_key, SCALAR_MAX_BYTES};
 use crate::error::{KeyRejected, Unspecified};
 use crate::pkcs8::{Document, Version};
 use crate::ptr::{DetachableLcPtr, LcPtr};
-use crate::rand::SecureRandom;
-use crate::signature::{KeyPair, Signature};
-use crate::{digest, ec};
 #[cfg(not(feature = "fips"))]
 use aws_lc::EC_KEY_generate_key;
 #[cfg(feature = "fips")]
 use aws_lc::EC_KEY_generate_key_fips;
 use aws_lc::{
-    ECDSA_do_sign, EC_KEY_new_by_curve_name, EVP_PKEY_assign_EC_KEY, EVP_PKEY_new,
-    EVP_PKEY_set1_EC_KEY, EC_KEY, EVP_PKEY,
+    EC_KEY_new_by_curve_name, EVP_PKEY_assign_EC_KEY, EVP_PKEY_new, EVP_PKEY_set1_EC_KEY, EC_KEY,
+    EVP_PKEY,
 };
 use std::fmt;
-
-use std::fmt::{Debug, Formatter};
 use zeroize::Zeroize;
 
-/// An ECDSA key pair, used for signing.
-#[allow(clippy::module_name_repetitions)]
-pub struct EcdsaKeyPair {
-    algorithm: &'static EcdsaSigningAlgorithm,
-    ec_key: LcPtr<EC_KEY>,
+/// An elltipic curve algorithm
+#[derive(PartialEq, Eq, Debug)]
+pub struct Algorithm {
+    id: &'static crate::ec::AlgorithmID,
+}
+
+/// NSA Suite B P-256 (secp256r1) curve
+pub const P256: Algorithm = Algorithm {
+    id: &crate::ec::AlgorithmID::P256,
+};
+/// NSA Suite B P-384 (secp384r1) curve
+pub const P384: Algorithm = Algorithm {
+    id: &crate::ec::AlgorithmID::P384,
+};
+/// NSA Suite B P-521 (secp521r1) curve
+pub const P521: Algorithm = Algorithm {
+    id: &crate::ec::AlgorithmID::P521,
+};
+/// secp256k1 curve
+pub const P256K1: Algorithm = Algorithm {
+    id: &crate::ec::AlgorithmID::P256K1,
+};
+
+/// An elliptic curve key pair, not bound to any particular purpose.
+pub struct KeyPair {
+    alg: &'static Algorithm,
+    pub(crate) ec_key: LcPtr<EC_KEY>,
     pubkey: PublicKey,
 }
 
-impl Debug for EcdsaKeyPair {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        f.write_str(&format!("EcdsaKeyPair {{ public_key: {:?} }}", self.pubkey))
+impl fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        f.write_str(&format!("KeyPair {{ public_key: {:?} }}", self.pubkey))
     }
 }
 
-unsafe impl Send for EcdsaKeyPair {}
+unsafe impl Send for KeyPair {}
 
-unsafe impl Sync for EcdsaKeyPair {}
-
-impl KeyPair for EcdsaKeyPair {
-    type PublicKey = PublicKey;
-
-    #[inline]
-    fn public_key(&self) -> &Self::PublicKey {
-        &self.pubkey
-    }
-}
+unsafe impl Sync for KeyPair {}
 
 pub(crate) unsafe fn generate_key(nid: i32) -> Result<LcPtr<EVP_PKEY>, Unspecified> {
     let ec_key = DetachableLcPtr::new(EC_KEY_new_by_curve_name(nid))?;
@@ -74,29 +80,40 @@ pub(crate) unsafe fn generate_key(nid: i32) -> Result<LcPtr<EVP_PKEY>, Unspecifi
     Ok(evp_pkey)
 }
 
-impl EcdsaKeyPair {
-    unsafe fn new(
-        algorithm: &'static EcdsaSigningAlgorithm,
-        ec_key: LcPtr<EC_KEY>,
-    ) -> Result<Self, ()> {
+impl KeyPair {
+    unsafe fn new(alg: &'static Algorithm, ec_key: LcPtr<EC_KEY>) -> Result<Self, ()> {
         let pubkey = ec::marshal_public_key(&ec_key.as_const())?;
         Ok(Self {
-            algorithm,
+            alg,
             ec_key,
             pubkey,
         })
     }
 
-    /// Constructs an ECDSA key pair by parsing an unencrypted PKCS#8 v1
-    /// id-ecPublicKey `ECPrivateKey` key.
+    /// Generates a new key pair.
     ///
     /// # Errors
-    /// `error::KeyRejected` if bytes do not encode an ECDSA key pair or if the key is otherwise not
+    /// `error::Unspecified` on internal error.
+    ///
+    pub fn generate(alg: &'static Algorithm) -> Result<Self, Unspecified> {
+        unsafe {
+            let evp_pkey = generate_key(alg.id.nid())?;
+
+            let ec_key = evp_pkey.get_ec_key()?;
+
+            validate_ec_key(&ec_key.as_const(), alg.id.nid())?;
+
+            Ok(Self::new(alg, ec_key)?)
+        }
+    }
+
+    /// Constructs an key pair by parsing an unencrypted PKCS#8 v1 id-ecPublicKey
+    /// `ECPrivateKey` key.
+    ///
+    /// # Errors
+    /// `error::KeyRejected` if bytes do not encode an key pair or if the key is otherwise not
     /// acceptable.
-    pub fn from_pkcs8(
-        alg: &'static EcdsaSigningAlgorithm,
-        pkcs8: &[u8],
-    ) -> Result<Self, KeyRejected> {
+    pub fn from_pkcs8(alg: &'static Algorithm, pkcs8: &[u8]) -> Result<Self, KeyRejected> {
         unsafe {
             let evp_pkey = LcPtr::try_from(pkcs8)?;
 
@@ -110,32 +127,12 @@ impl EcdsaKeyPair {
         }
     }
 
-    /// Generates a new key pair and returns the key pair serialized as a
-    /// PKCS#8 v1 document.
-    ///
-    /// # *ring* Compatibility
-    /// Our implementation ignores the `SecureRandom` parameter.
+    /// Serializes this `KeyPair` into a PKCS#8 v1 document.
     ///
     /// # Errors
     /// `error::Unspecified` on internal error.
     ///
-    pub fn generate_pkcs8(
-        alg: &'static EcdsaSigningAlgorithm,
-        _rng: &dyn SecureRandom,
-    ) -> Result<Document, Unspecified> {
-        unsafe {
-            let evp_pkey = generate_key(alg.0.id.nid())?;
-
-            evp_pkey.marshall_private_key(Version::V1)
-        }
-    }
-
-    /// Serializes this `EcdsaKeyPair` into a PKCS#8 v1 document.
-    ///
-    /// # Errors
-    /// `error::Unspecified` on internal error.
-    ///
-    pub fn to_pkcs8(&self) -> Result<Document, Unspecified> {
+    pub fn to_pkcs8v1(&self) -> Result<Document, Unspecified> {
         unsafe {
             let evp_pkey = LcPtr::new(EVP_PKEY_new())?;
             if 1 != EVP_PKEY_set1_EC_KEY(*evp_pkey, *self.ec_key) {
@@ -145,7 +142,22 @@ impl EcdsaKeyPair {
         }
     }
 
-    /// Constructs an ECDSA key pair from the private key and public key bytes
+    /// Serializes this `KeyPair` into a PKCS#8 v2 document.
+    ///
+    /// # Errors
+    /// `error::Unspecified` on internal error.
+    ///
+    pub fn to_pkcs8v2(&self) -> Result<Document, Unspecified> {
+        unsafe {
+            let evp_pkey = LcPtr::new(EVP_PKEY_new())?;
+            if 1 != EVP_PKEY_set1_EC_KEY(*evp_pkey, *self.ec_key) {
+                return Err(Unspecified);
+            }
+            evp_pkey.marshall_private_key(Version::V2)
+        }
+    }
+
+    /// Constructs an key pair from the private key and public key bytes
     ///
     /// The private key must encoded as a big-endian fixed-length integer. For
     /// example, a P-256 private key must be 32 bytes prefixed with leading
@@ -156,7 +168,7 @@ impl EcdsaKeyPair {
     /// [SEC 1: Elliptic Curve Cryptography, Version 2.0].
     ///
     /// This is intended for use by code that deserializes key pairs. It is
-    /// recommended to use `EcdsaKeyPair::from_pkcs8()` (with a PKCS#8-encoded
+    /// recommended to use `KeyPair::from_pkcs8()` (with a PKCS#8-encoded
     /// key) instead.
     ///
     /// [SEC 1: Elliptic Curve Cryptography, Version 2.0]:
@@ -165,12 +177,12 @@ impl EcdsaKeyPair {
     /// # Errors
     /// `error::KeyRejected` if parsing failed or key otherwise unacceptable.
     pub fn from_private_key_and_public_key(
-        alg: &'static EcdsaSigningAlgorithm,
+        alg: &'static Algorithm,
         private_key: &[u8],
         public_key: &[u8],
     ) -> Result<Self, KeyRejected> {
         unsafe {
-            let ec_group = ec::ec_group_from_nid(alg.0.id.nid())?;
+            let ec_group = ec::ec_group_from_nid(alg.id.nid())?;
             let public_ec_point = ec::ec_point_from_bytes(&ec_group, public_key)
                 .map_err(|_| KeyRejected::invalid_encoding())?;
             let private_bn = DetachableLcPtr::try_from(private_key)?;
@@ -183,7 +195,7 @@ impl EcdsaKeyPair {
 
     /// Exposes the private key encoded as a big-endian fixed-length integer.
     ///
-    /// For most use-cases, `EcdsaKeyPair::to_pkcs8()` should be preferred.
+    /// For most use-cases, `KeyPair::to_pkcs8()` should be preferred.
     ///
     /// # Errors
     /// `error::KeyRejected` if parsing failed or key otherwise unacceptable.
@@ -192,7 +204,7 @@ impl EcdsaKeyPair {
             let mut priv_key_bytes = [0u8; SCALAR_MAX_BYTES];
 
             let key_len = ec::marshal_private_key_to_buffer(
-                self.algorithm.id,
+                self.alg.id,
                 &mut priv_key_bytes,
                 &self.ec_key.as_const(),
             )?;
@@ -201,32 +213,20 @@ impl EcdsaKeyPair {
         }
     }
 
-    /// Returns the signature of the message using a random nonce.
+    /// Exposes the private key encoded as a big-endian fixed-length integer.
     ///
-    /// # *ring* Compatibility
-    /// Our implementation ignores the `SecureRandom` parameter.
+    /// For most use-cases, `KeyPair::to_pkcs8()` should be preferred.
     ///
     /// # Errors
-    /// `error::Unspecified` on internal error.
-    ///
-    #[inline]
-    pub fn sign(&self, _rng: &dyn SecureRandom, message: &[u8]) -> Result<Signature, Unspecified> {
-        unsafe {
-            let digest = digest::digest(self.algorithm.digest, message);
-            let digest = digest.as_ref();
-            let ecdsa_sig = LcPtr::new(ECDSA_do_sign(digest.as_ptr(), digest.len(), *self.ec_key))?;
-            match self.algorithm.sig_format {
-                EcdsaSignatureFormat::ASN1 => ec::ecdsa_sig_to_asn1(&ecdsa_sig),
-                EcdsaSignatureFormat::Fixed => {
-                    ec::ecdsa_sig_to_fixed(self.algorithm.id, &ecdsa_sig)
-                }
-            }
-        }
+    /// `error::KeyRejected` if parsing failed or key otherwise unacceptable.
+    pub fn public_key(&self) -> &PublicKey {
+        &self.pubkey
     }
 }
 
+/// A raw private key.
 #[derive(Clone)]
-pub struct PrivateKey<'a>(&'a EcdsaKeyPair, Box<[u8]>);
+pub struct PrivateKey<'a>(&'a KeyPair, Box<[u8]>);
 
 impl Drop for PrivateKey<'_> {
     fn drop(&mut self) {
@@ -234,14 +234,14 @@ impl Drop for PrivateKey<'_> {
     }
 }
 
-impl Debug for PrivateKey<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
+impl fmt::Debug for PrivateKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         f.write_str("EcdsaPrivateKey()")
     }
 }
 
 impl<'a> PrivateKey<'a> {
-    fn new(key_pair: &'a EcdsaKeyPair, box_bytes: Box<[u8]>) -> Self {
+    fn new(key_pair: &'a KeyPair, box_bytes: Box<[u8]>) -> Self {
         PrivateKey(key_pair, box_bytes)
     }
 }
@@ -255,3 +255,29 @@ impl AsRef<[u8]> for PrivateKey<'_> {
 
 unsafe impl Send for PrivateKey<'_> {}
 unsafe impl Sync for PrivateKey<'_> {}
+
+/// A raw public key.
+#[derive(Clone)]
+pub struct PublicKey(Box<[u8]>);
+
+impl fmt::Debug for PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        f.write_str(&format!(
+            "EcdsaPublicKey(\"{}\")",
+            crate::test::to_hex(self.0.as_ref())
+        ))
+    }
+}
+
+impl PublicKey {
+    pub(crate) fn new(pubkey_box: Box<[u8]>) -> Self {
+        PublicKey(pubkey_box)
+    }
+}
+
+impl AsRef<[u8]> for PublicKey {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}

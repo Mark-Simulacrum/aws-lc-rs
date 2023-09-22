@@ -3,17 +3,19 @@
 // Modifications copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR ISC
 
-use crate::error::{KeyRejected, Unspecified};
-use core::fmt;
+pub mod key_pair;
 
+use crate::error::{KeyRejected, Unspecified};
+
+use crate::pkey::elliptic_curve::PublicKey;
 use crate::ptr::{ConstPointer, DetachableLcPtr, LcPtr};
 
-use crate::signature::{Signature, VerificationAlgorithm};
-use crate::{digest, sealed, test};
+use crate::signature::Signature;
+
 use aws_lc::{
     point_conversion_form_t, BN_bn2bin_padded, BN_num_bytes, ECDSA_SIG_from_bytes,
     ECDSA_SIG_get0_r, ECDSA_SIG_get0_s, ECDSA_SIG_new, ECDSA_SIG_set0, ECDSA_SIG_to_bytes,
-    ECDSA_do_verify, EC_GROUP_get_curve_name, EC_GROUP_new_by_curve_name, EC_KEY_get0_group,
+    EC_GROUP_get_curve_name, EC_GROUP_new_by_curve_name, EC_KEY_get0_group,
     EC_KEY_get0_private_key, EC_KEY_get0_public_key, EC_KEY_new, EC_KEY_new_by_curve_name,
     EC_KEY_set_group, EC_KEY_set_private_key, EC_KEY_set_public_key, EC_POINT_new,
     EC_POINT_oct2point, EC_POINT_point2oct, NID_X9_62_prime256v1, NID_secp256k1, NID_secp384r1,
@@ -27,19 +29,14 @@ use aws_lc::{EC_KEY_check_key, EC_KEY_generate_key};
 #[cfg(test)]
 use aws_lc::EC_POINT_mul;
 
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::mem::MaybeUninit;
-use std::ops::Deref;
-use std::os::raw::{c_int, c_uint};
+
+use std::os::raw::c_int;
 #[cfg(test)]
 use std::ptr::null;
 use std::ptr::null_mut;
 use std::slice;
-
-#[cfg(feature = "ring-sig-verify")]
-use untrusted::Input;
-
-pub(crate) mod key_pair;
 
 const ELEM_MAX_BITS: usize = 521;
 pub(crate) const ELEM_MAX_BYTES: usize = (ELEM_MAX_BITS + 7) / 8;
@@ -60,130 +57,29 @@ pub(crate) const PUBLIC_KEY_MAX_LEN: usize = 1 + (2 * ELEM_MAX_BYTES);
 /// `42` is the length of the P-521 template.
 pub const PKCS8_DOCUMENT_MAX_LEN: usize = 42 + SCALAR_MAX_BYTES + PUBLIC_KEY_MAX_LEN;
 
-/// An ECDSA verification algorithm.
-#[derive(Debug, Eq, PartialEq)]
-pub struct EcdsaVerificationAlgorithm {
-    pub(super) id: &'static AlgorithmID,
-    pub(super) digest: &'static digest::Algorithm,
-    pub(super) bits: c_uint,
-    pub(super) sig_format: EcdsaSignatureFormat,
-}
-
-/// An ECDSA signing algorithm.
-#[derive(Debug, Eq, PartialEq)]
-pub struct EcdsaSigningAlgorithm(pub(crate) &'static EcdsaVerificationAlgorithm);
-
-impl Deref for EcdsaSigningAlgorithm {
-    type Target = EcdsaVerificationAlgorithm;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-impl sealed::Sealed for EcdsaVerificationAlgorithm {}
-impl sealed::Sealed for EcdsaSigningAlgorithm {}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum EcdsaSignatureFormat {
-    ASN1,
-    Fixed,
-}
-
 #[derive(Debug, Eq, PartialEq)]
 #[allow(non_camel_case_types)]
 pub(crate) enum AlgorithmID {
-    ECDSA_P256,
-    ECDSA_P384,
-    ECDSA_P521,
-    ECDSA_P256K1,
+    P256,
+    P384,
+    P521,
+    P256K1,
 }
 
 impl AlgorithmID {
     #[inline]
     pub(crate) fn nid(&'static self) -> i32 {
         match self {
-            AlgorithmID::ECDSA_P256 => NID_X9_62_prime256v1,
-            AlgorithmID::ECDSA_P384 => NID_secp384r1,
-            AlgorithmID::ECDSA_P521 => NID_secp521r1,
-            AlgorithmID::ECDSA_P256K1 => NID_secp256k1,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct PublicKey(Box<[u8]>);
-
-impl Debug for PublicKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        f.write_str(&format!(
-            "EcdsaPublicKey(\"{}\")",
-            test::to_hex(self.0.as_ref())
-        ))
-    }
-}
-
-impl PublicKey {
-    fn new(pubkey_box: Box<[u8]>) -> Self {
-        PublicKey(pubkey_box)
-    }
-}
-
-impl AsRef<[u8]> for PublicKey {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-unsafe impl Send for PublicKey {}
-unsafe impl Sync for PublicKey {}
-
-impl VerificationAlgorithm for EcdsaVerificationAlgorithm {
-    #[inline]
-    #[cfg(feature = "ring-sig-verify")]
-    fn verify(
-        &self,
-        public_key: Input<'_>,
-        msg: Input<'_>,
-        signature: Input<'_>,
-    ) -> Result<(), Unspecified> {
-        self.verify_sig(
-            public_key.as_slice_less_safe(),
-            msg.as_slice_less_safe(),
-            signature.as_slice_less_safe(),
-        )
-    }
-
-    fn verify_sig(
-        &self,
-        public_key: &[u8],
-        msg: &[u8],
-        signature: &[u8],
-    ) -> Result<(), Unspecified> {
-        unsafe {
-            let ec_group = ec_group_from_nid(self.id.nid())?;
-            let ec_point = ec_point_from_bytes(&ec_group, public_key)?;
-            let ec_key = ec_key_from_public_point(&ec_group, &ec_point)?;
-
-            let ecdsa_sig = match self.sig_format {
-                EcdsaSignatureFormat::ASN1 => ecdsa_sig_from_asn1(signature),
-                EcdsaSignatureFormat::Fixed => ecdsa_sig_from_fixed(self.id, signature),
-            }?;
-            let msg_digest = digest::digest(self.digest, msg);
-            let msg_digest = msg_digest.as_ref();
-
-            if 1 != ECDSA_do_verify(msg_digest.as_ptr(), msg_digest.len(), *ecdsa_sig, *ec_key) {
-                return Err(Unspecified);
-            }
-
-            Ok(())
+            AlgorithmID::P256 => NID_X9_62_prime256v1,
+            AlgorithmID::P384 => NID_secp384r1,
+            AlgorithmID::P521 => NID_secp521r1,
+            AlgorithmID::P256K1 => NID_secp256k1,
         }
     }
 }
 
 #[inline]
-unsafe fn validate_ec_key(
+pub(crate) unsafe fn validate_ec_key(
     ec_key: &ConstPointer<EC_KEY>,
     expected_curve_nid: i32,
 ) -> Result<(), KeyRejected> {
@@ -309,7 +205,7 @@ pub(crate) unsafe fn ec_key_generate(nid: c_int) -> Result<DetachableLcPtr<EC_KE
 }
 
 #[inline]
-unsafe fn ec_key_from_public_private(
+pub(crate) unsafe fn ec_key_from_public_private(
     ec_group: &LcPtr<EC_GROUP>,
     public_ec_point: &LcPtr<EC_POINT>,
     private_bignum: &DetachableLcPtr<BIGNUM>,
@@ -376,7 +272,9 @@ unsafe fn ec_point_to_bytes(
 }
 
 #[inline]
-unsafe fn ecdsa_sig_to_asn1(ecdsa_sig: &LcPtr<ECDSA_SIG>) -> Result<Signature, Unspecified> {
+pub(crate) unsafe fn ecdsa_sig_to_asn1(
+    ecdsa_sig: &LcPtr<ECDSA_SIG>,
+) -> Result<Signature, Unspecified> {
     let mut out_bytes = MaybeUninit::<*mut u8>::uninit();
     let mut out_len = MaybeUninit::<usize>::uninit();
 
@@ -394,7 +292,7 @@ unsafe fn ecdsa_sig_to_asn1(ecdsa_sig: &LcPtr<ECDSA_SIG>) -> Result<Signature, U
 }
 
 #[inline]
-unsafe fn ecdsa_sig_to_fixed(
+pub(crate) unsafe fn ecdsa_sig_to_fixed(
     alg_id: &'static AlgorithmID,
     sig: &LcPtr<ECDSA_SIG>,
 ) -> Result<Signature, Unspecified> {
@@ -423,21 +321,21 @@ unsafe fn ecdsa_sig_to_fixed(
 }
 
 #[inline]
-unsafe fn ecdsa_sig_from_asn1(signature: &[u8]) -> Result<LcPtr<ECDSA_SIG>, ()> {
+pub(crate) unsafe fn ecdsa_sig_from_asn1(signature: &[u8]) -> Result<LcPtr<ECDSA_SIG>, ()> {
     LcPtr::new(ECDSA_SIG_from_bytes(signature.as_ptr(), signature.len()))
 }
 
 #[inline]
 const fn ecdsa_fixed_number_byte_size(alg_id: &'static AlgorithmID) -> usize {
     match alg_id {
-        AlgorithmID::ECDSA_P256 | AlgorithmID::ECDSA_P256K1 => 32,
-        AlgorithmID::ECDSA_P384 => 48,
-        AlgorithmID::ECDSA_P521 => 66,
+        AlgorithmID::P256 | AlgorithmID::P256K1 => 32,
+        AlgorithmID::P384 => 48,
+        AlgorithmID::P521 => 66,
     }
 }
 
 #[inline]
-unsafe fn ecdsa_sig_from_fixed(
+pub(crate) unsafe fn ecdsa_sig_from_fixed(
     alg_id: &'static AlgorithmID,
     signature: &[u8],
 ) -> Result<LcPtr<ECDSA_SIG>, ()> {
@@ -461,8 +359,7 @@ unsafe fn ecdsa_sig_from_fixed(
 
 #[cfg(test)]
 mod tests {
-    use crate::ec::key_pair::EcdsaKeyPair;
-    use crate::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+    use crate::pkey::elliptic_curve::{KeyPair, P256};
     use crate::test::from_dirty_hex;
     use crate::{signature, test};
 
@@ -475,7 +372,7 @@ mod tests {
             437af3f7af6e724"#,
         );
 
-        let result = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &input);
+        let result = KeyPair::from_pkcs8(&P256, &input);
         result.unwrap();
     }
 

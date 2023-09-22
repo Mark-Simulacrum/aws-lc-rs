@@ -111,6 +111,7 @@ pub mod hmac;
 pub mod io;
 pub mod pbkdf2;
 pub mod pkcs8;
+pub mod pkey;
 pub mod rand;
 pub mod signature;
 pub mod test;
